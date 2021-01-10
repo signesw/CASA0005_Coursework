@@ -921,10 +921,7 @@ Bivariate <- ggdraw() +
 
 ```
 
-![Alt text](C:\Users\signe\OneDrive - University College London\Documents\UCL_MSc\CASA0005_GIS\GIS_Coursework\Coursework\bivariate.png)
-
-Figure 9:Bivariate map showing dependence on public transport against household income. Shades of darker green indicate high dependence with low income levels
-
+![Figure 9:Bivariate map showing dependence on public transport against household income. Shades of darker green indicate high dependence with low income levels](C:\Users\signe\OneDrive - University College London\Documents\UCL_MSc\CASA0005_GIS\GIS_Coursework\Coursework\bivariate.png)
 
 #### Top groups by borough
 
