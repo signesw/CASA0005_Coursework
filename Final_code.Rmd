@@ -18,7 +18,7 @@ knitr::opts_chunk$set(message = FALSE,warning=FALSE,fig.align="center")
 
 This page includes the full code used in analysing the effect of suspending the Zip Oyster card for 11-18 year-olds in London.
 
-To reproduce the analysis, please fork and clone the associated [GitHub repository](https://github.com/signesw/GIS_Coursework/tree/main/Coursework), where all data used for the analysis can be found.
+To reproduce the analysis, please fork and clone the associated [GitHub repository](https://github.com/signesw/CASA0005_Coursework), where all data used for the analysis can be found.
 
 ## 1. Setting up - Loading packages required
 
@@ -60,6 +60,7 @@ LondonSchools <- read.csv(here::here("Raw_data","edubasealldata.csv")) %>%
   dplyr::filter(str_detect(EstablishmentStatus..name., "Open")) %>%   dplyr::filter(str_detect(DistrictAdministrative..code., "^E09"))
 
 #Create a simplefeatures object out of the LondonSchools
+
 LondonSchools_sf <- LondonSchools %>% 
   st_as_sf(., coords = c("Easting", "Northing")) %>% 
   st_set_crs(27700)
@@ -124,7 +125,7 @@ CatchmentWithGeometry <- dplyr::left_join(FinalSchools,FinalCatchment,by="URN")
 
 #### Origin Destinaton Pairs
 
-From the school geomtery and flow dataset, we can create origin-destination pairs, using the stplanr package with the `od2line`function, by taking the centroid of each LSOA to be our origin points, and school as our destination points.
+From the school geometry and flow dataset, we can create origin-destination pairs, using the stplanr package with the `od2line`function, by taking the centroid of each LSOA to be our origin points, and school as our destination points.
 
 ```{r}
 #Simplify table
@@ -151,15 +152,17 @@ zones=rbind(Points_Schools,Points_LSOA)
 travel_lines <- od2line(flow = FlowsWithGeometry, zones = zones)
 ```
 
-Now we, have our straight-line origin destination lines, we can map them onto our study area
+Now we have our straight-line origin destination lines, we can map them onto our study area
 
 ```{r plot lines}
+
 tmap_mode("view")
 plt <- tm_shape(travel_lines) +
   tm_lines(palette = "plasma", breaks = c(0, 5, 10, 20, 40, 100,200),
            lwd = "Pupil_count",
            scale = 9,
-           id="route_number",
+           id="LSOA_CODE",
+           popup.vars= c("LSOA_CODE", "Secondary_School_Name","Pupil_count"),
            title.lwd = "Number of pupils",
            alpha = 0.6,
            col = "Pupil_count",
@@ -204,7 +207,8 @@ plt_routes <- tm_shape(routes) +
   tm_lines(palette = "plasma", breaks = c(0, 5, 10, 20, 40, 100,200),
            lwd = "Pupil_count",
            scale = 9,
-           id="route_number",
+           id="LSOA_CODE",
+           popup.vars= c("LSOA_CODE", "Secondary_School_Name","Pupil_count"),
            title.lwd = "Number of pupils",
            alpha = 0.6,
            col = "Pupil_count",
