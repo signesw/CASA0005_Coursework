@@ -1,4 +1,4 @@
-# CASA0005_Coursework
+# CASA0005 Coursework
 
 This repository includes all the files used to produce my submission for the CASA0005- Geographic Information Systems and Science coursework 
 
