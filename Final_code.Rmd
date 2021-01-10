@@ -1,0 +1,967 @@
+---
+title: "CASA0005 GIS Coursework"
+output: html_document
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE,warning=FALSE,fig.align="center")
+```
+
+# Assessing the effect of removing free travel for 11 to 18-year-olds in London.
+
+## Introduction
+
+This page includes the full code used in analysing the effect of suspending the Zip Oyster card for 11-18 year-olds in London.
+
+To reproduce the analysis, please fork and clone the associated [GitHub repository](https://github.com/signesw/GIS_Coursework/tree/main/Coursework), where all data used for the analysis can be found.
+
+## 1. Setting up - Loading packages required
+
+This code loads all the packages used in the analysis. 
+
+```{r packages}
+# Loading packages
+library(sf)
+library(tidyverse)
+library(here)
+library(stringr)
+library(ggplot2)
+library(tmap)
+library(sf)
+library(geojson)
+library(ggspatial)
+library(geojsonio)
+library(tmaptools)
+library(viridis)
+library(janitor)
+library(cowplot)
+library(stplanr)
+library(osrm)
+library(knitr)
+
+```
+
+## 2. Developing the index of public transport dependence
+
+### 2.1. Calculating Travel Distance
+
+We will start by calculating average travel distances, based on school location supplied by the [Department for Education](https://get-information-schools.service.gov.uk/Downloads)  and the secondary schoolflows supplied by the [Greater London Authority](https://data.london.gov.uk/dataset/london-schools-atlas).
+
+First, we will load the school locations, and create an sf object. 
+
+```{r Schools}
+#Reading in all schools basefile, and filtering out for the ones that are open, and in London
+LondonSchools <- read.csv(here::here("Raw_data","edubasealldata.csv")) %>% 
+  dplyr::filter(str_detect(EstablishmentStatus..name., "Open")) %>%   dplyr::filter(str_detect(DistrictAdministrative..code., "^E09"))
+
+#Create a simplefeatures object out of the LondonSchools
+LondonSchools_sf <- LondonSchools %>% 
+  st_as_sf(., coords = c("Easting", "Northing")) %>% 
+  st_set_crs(27700)
+
+```
+
+Now we will load our LSOA and Boroughs shapefiles
+
+```{r Shapefiles, results="hide", fig.cap="Fig. 1. Study Area"}
+#Now load London LSOA shapefile
+LSOA <- st_read(here::here("Raw_data","statistical-gis-boundaries-london/statistical-gis-boundaries-london/ESRI/LSOA_2011_London_gen_MHW.shp")) %>% 
+  st_transform(27700)
+
+#Load boroughs shapefile too
+Boroughs <- st_read(here::here("Raw_data","statistical-gis-boundaries-london/statistical-gis-boundaries-london/ESRI/London_Borough_Excluding_MHW.shp")) %>% 
+st_transform(27700)
+
+
+#Let's plot our Study Area
+study_area <- ggplot()+ geom_sf(data=LSOA, color="#696868",size=0.1,linetype = "solid", fill='#ede9e8')+
+          geom_sf(data=Boroughs,color="black",size=0.3,linetype = "solid", fill=NA)+
+          theme_map()+
+          annotation_scale(location = "bl")+
+          annotation_north_arrow(location = "tl", which_north = "true",
+                         height = unit(1, "cm"),
+                         width = unit(1, "cm"),
+                         pad_y = unit(0.1, "in"),
+                         style = north_arrow_fancy_orienteering)
+
+study_area
+
+#Remove points outside of London
+LondonSchools_sf <- LondonSchools_sf[LSOA,]
+```
+
+Finally, we will load our flows dataset, and filter out our school locations so we only get the schools that we have flow data for. We also need to filter our flows dataset to not include LSOAs outside of Greater London.Finally, the school locations are merged with the flows dataset. 
+
+```{r Flows}
+#read in the catchment flow CSV
+Catchment <- read.csv(here::here("Raw_data", "Catchments_SecSchootoLSOA_2016_LDS.csv"))
+
+#Getting unique URN values for the schools with flows
+CatchmentDistinct <- unique(Catchment$ï..Secondary_School_URN)
+
+#Now filter out the schools with flows to get our final schools
+FinalSchools <- filter(LondonSchools_sf, URN %in% CatchmentDistinct)
+
+#Get unique schools
+URNs <- unique(FinalSchools$URN)
+
+#Filter out LSOAs that are not within London
+LSOAs <- unique(LSOA$LSOA11CD)
+FinalCatchment <- subset(Catchment, ï..Secondary_School_URN %in% URNs) %>%  subset(., LSOA_CODE %in% LSOAs)
+
+#Cleaning the data (remove unecessary columns):
+FinalCatchment <- dplyr::select(FinalCatchment, -c(Secondary2LSOA_Flow_No.)) %>% 
+  rename(URN="ï..Secondary_School_URN")
+
+#Merge geometry column from schools to flow dataframe -
+CatchmentWithGeometry <- dplyr::left_join(FinalSchools,FinalCatchment,by="URN")
+```
+
+#### Origin Destinaton Pairs
+
+From the school geomtery and flow dataset, we can create origin-destination pairs, using the stplanr package with the `od2line`function, by taking the centroid of each LSOA to be our origin points, and school as our destination points.
+
+```{r}
+#Simplify table
+FlowsWithGeometry <- dplyr::select(CatchmentWithGeometry, c(Secondary_School_Name,LSOA_CODE, Pupil_count,geometry))
+
+#Rename column in LSOA
+LSOA <- LSOA %>% rename(LSOA_CODE="LSOA11CD")
+
+#take centroid of LSOA areas
+Points_LSOA <- st_centroid(LSOA)
+
+#lets just look at LSOA Code and geometry
+Points_LSOA <- dplyr::select(Points_LSOA, c(LSOA_CODE,geometry)) %>% 
+  rename(Name="LSOA_CODE")
+
+#get a df with just school name and geometry
+Points_Schools <- dplyr::select(FlowsWithGeometry, c(Secondary_School_Name,geometry)) %>% 
+  rename(Name="Secondary_School_Name")
+
+#join points and secondary school names
+zones=rbind(Points_Schools,Points_LSOA)
+
+#Get the travel lines
+travel_lines <- od2line(flow = FlowsWithGeometry, zones = zones)
+```
+
+Now we, have our straight-line origin destination lines, we can map them onto our study area
+
+```{r plot lines}
+tmap_mode("view")
+plt <- tm_shape(travel_lines) +
+  tm_lines(palette = "plasma", breaks = c(0, 5, 10, 20, 40, 100,200),
+           lwd = "Pupil_count",
+           scale = 9,
+           id="route_number",
+           title.lwd = "Number of pupils",
+           alpha = 0.6,
+           col = "Pupil_count",
+           title = "Pupil Count")+
+  tm_shape(FinalSchools)+
+          tm_dots(col="black", size=0.01,id="EstablishmentName")
+
+plt
+```
+
+#### Get walking routes
+
+After creating the origin-destination pairs, network routes were computed using stplanr `route()` function, calculating the shortest road network route using the OpenStreetMap Routing Machine (OSMR) API. 
+
+__NOTE__: The code below took approximately three hours to execute - once the sf object with routes was created, it was converted to a GEOJSON and saved in the GitHub repository. Instead, read this file for subsequent analysis
+
+```{r routes, eval=FALSE}
+#DO NOT RUN THIS CODE 
+
+#reproject travel lines geometry to wsg84
+travel_lines_transformed <- st_transform(travel_lines, 4326)
+
+routes <- route(
+  l = travel_lines_transformed,
+  route_fun = osrmRoute,
+  returnclass = "sf")
+
+#Once routes have been created, write as a GEOJSON
+st_write(routes,"routes.geojson")
+
+```
+
+Instead, the routes sf object was read as an sf object and plotted
+```{r read routes, results="hide"}
+#read routes 
+routes <- st_read(here::here("routes.geojson"))
+```
+
+```{r plotting routes}
+tmap_mode("view")
+plt_routes <- tm_shape(routes) +
+  tm_lines(palette = "plasma", breaks = c(0, 5, 10, 20, 40, 100,200),
+           lwd = "Pupil_count",
+           scale = 9,
+           id="route_number",
+           title.lwd = "Number of pupils",
+           alpha = 0.6,
+           col = "Pupil_count",
+           title = "Pupil Count")+
+  tm_shape(FinalSchools)+
+  tm_dots(col="black",size=0.01,id="EstablishmentName")
+  
+plt_routes
+
+```
+
+#### Get distances from straight line and network routes
+
+From the two types of routes, we can calculate average distances per LSOA
+
+Straight line distances:
+```{r straight line distances}
+#Straight line distances
+l_distances <- geo_length(travel_lines)
+# Convert to km
+travel_lines$distances <- l_distances/1000
+
+#add column for average distance traveled, grouped by LSOA
+travel_lines$total_distance <- ((travel_lines$Pupil_count)*(travel_lines$distances))
+#Make new df grouped by LSOA
+Sums_LSOA <- st_set_geometry(travel_lines,NULL) %>% 
+  dplyr::select(., c(LSOA_CODE,Pupil_count,total_distance)) %>% group_by(LSOA_CODE) %>% summarize_all(sum)
+Sums_LSOA <- transform(Sums_LSOA, average_distance = (total_distance / Pupil_count))
+
+```
+
+And for network routes:
+```{r}
+##Now get distances for routes
+#remove geometry from routes
+routes_no_geo <- st_set_geometry(routes,NULL)
+
+#remove routes sf to clear up memory
+rm(routes)
+
+#add column for average distance traveled
+routes_no_geo$total_distance_routes <- ((routes_no_geo$Pupil_count)*(routes_no_geo$distance))
+
+#Group by LSOA
+Sums_LSOA_routes <- routes_no_geo %>% 
+  dplyr::select(., c(LSOA_CODE,Pupil_count,total_distance_routes)) %>% group_by(LSOA_CODE) %>% summarize_all(sum)
+
+Sums_LSOA_routes <- transform(Sums_LSOA_routes, average_distance = (total_distance_routes / Pupil_count))
+```
+
+Now, we can produce histograms for both distances, in order to compare them. 
+
+```{r distance histograms, fig.asp=0.27,fig.align = "center", fig.cap="Figure 2: Histogram of A.)  Average Straight Line Distance , and B.) Average Network Route Distance"}
+#Plot histogram, straight line as well as route distance and compare
+
+#Get mean and median for both
+summarystatslines <- data.frame("stats"=c(median(Sums_LSOA$average_distance),mean(Sums_LSOA$average_distance)),
+                           "Line"=c("Median","Mean"))
+summarystatsroutes <- data.frame("stats"=c(median(Sums_LSOA_routes$average_distance),mean(Sums_LSOA_routes$average_distance)),
+                                "Line"=c("Median","Mean"))
+
+#Plot histogram for lines
+lines_hist <- ggplot(data=Sums_LSOA,aes(x=average_distance)) +
+  geom_histogram(bins=100, fill='#470137', color='gray') + #scale_x_log10()+
+  geom_vline(data = summarystatslines, 
+             mapping = aes(xintercept=stats,
+                           color = Line,
+                           linetype=Line 
+             ),
+             show.legend = T)+
+  xlab("Average Straight Line Distance to School (km)")+
+  ylab("Count")+
+  scale_y_continuous(expand = c(0,0),
+                     limits = c(0,400))+
+  scale_x_continuous(expand = c(0,0),
+                     limits = c(0,15))+
+  scale_color_manual(name = "Statistics", values = c(Median = "#6b0c1b", Mean = "#d1949e"))+
+  guides(color = guide_legend(override.aes = list(linetype = c('solid','dashed'))),
+         linetype = FALSE)+
+  theme_bw()
+
+
+#Plot histogram for routes
+routes_hist <- ggplot(data=Sums_LSOA_routes,aes(x=average_distance)) +
+  geom_histogram(bins=100, fill='#470137', color='gray') + #scale_x_log10()+
+  geom_vline(data = summarystatsroutes, 
+             mapping = aes(xintercept=stats,
+                           color = Line,
+                           linetype=Line 
+             ),
+             show.legend = T)+
+  xlab("Average Network Distance to School (km)")+
+  ylab("Count")+
+  scale_y_continuous(expand = c(0,0),
+                     limits = c(0,400))+
+  scale_x_continuous(expand = c(0,0),
+                     limits = c(0,19))+
+  scale_color_manual(name = "Statistics", values = c(Median = "#6b0c1b", Mean = "#d1949e"))+
+  guides(color = guide_legend(override.aes = list(linetype = c('solid','dashed'))),
+         linetype = FALSE)+
+  theme_bw()
+
+
+hists <- plot_grid(lines_hist, routes_hist, labels = "AUTO")
+
+hists
+```
+
+#### Map distances with histogram legend
+
+This next chunk of code creates a chloropleth map with LSOAs and average corresponding network distance, grouped by deciles
+
+```{r distance, histogrm, fig.align = "center",fig.cap="Figure 3: London LSOAs by Average Travel Distance. Colour is grouped by deciles. The darkest colour on the map represents the 10th decile. The grey areas are LSOAs with missing data"}
+#First let's round average distance to 1 decimal place
+Sums_LSOA_routes$average_distance_round=round(Sums_LSOA_routes$average_distance, digits = 1)
+
+# get decile breaks based on the rounded values
+Sums_LSOA_routes$deciles <- ntile(Sums_LSOA_routes$average_distance_round, 10)
+dbreaks=quantile(Sums_LSOA_routes$average_distance_round, probs = seq(0, 1, 1/10))
+dbreaks <- replace(dbreaks, c(1), 0)
+
+#cut dataframe based on breaks
+Sums_LSOA_routes<- mutate(Sums_LSOA_routes, deciles = cut(average_distance_round, dbreaks,c(1,2,3,4,5,6,7,8,9,10)))
+
+mycolour <- colorRampPalette(c("#470137","#faebf7"))(10)
+
+histbreaks <- seq(0,12,0.1)
+
+#Plot legend
+histogram_legend <- Sums_LSOA_routes %>%
+  ggplot(aes(x=average_distance_round)) +
+  geom_histogram(binwidth=0.1,aes(fill = as.factor(deciles)),breaks=histbreaks,color=NA)+ 
+  scale_fill_manual(name = "Average distance deciles",values=rev(mycolour))+
+  geom_vline(xintercept = (dbreaks), linetype="dashed")+
+  guides(colour = guide_legend(nrow =1))+
+  xlab("Average Network Travel Distance (km)")+
+  ylab("Count")+
+  theme_classic()+
+  theme(legend.position="none")
+
+histogram_legend <- histogram_legend + 
+  scale_y_continuous("Count", expand = c(0, 0), breaks = seq(0, 300, 50), 
+                     limits = c(0, 200)) + 
+  scale_x_continuous("Average Network Travel Distance (km)", expand = c(0,0),breaks=seq(0,19,1))+
+  theme(axis.text=element_text(size=7))
+
+
+#Let's join this to LSOA data and map
+LSOA_with_average <- left_join(LSOA,Sums_LSOA_routes, by="LSOA_CODE")
+
+
+#calculate and group by deciles
+LSOA_with_average$decile <- ntile(LSOA_with_average$average_distance, 10)
+#Distribution of average distance travelled
+
+
+#Create a plot with histogram as legend
+
+legend <- ggplotGrob(histogram_legend)
+
+#Chloropleth
+Distance_deciles <- ggplot(LSOA_with_average) + 
+  geom_sf(aes(fill=as.factor(decile)),color=NA,size = 0.001)+
+  theme_void()+
+  scale_fill_manual(name = "Average distance deciles",values=rev(mycolour),na.value="gray")+
+  scale_x_continuous(expand = c(0, 0)) + 
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(legend.position = "none")
+
+#Let's expand the London map to make place for our histogram
+Final <- Distance_deciles + coord_sf(xlim = c(502500, 591956.7), ylim = c(145850.8, 201500)) +
+  #adding the histogram
+  annotation_custom(grob = ggplotGrob(histogram_legend), ymin=145850.8, ymax=168000.8,xmin=551500,xmax=591956.7)
+
+#and plot
+Final
+
+```
+
+### 2.2. Other variables used in index
+
+Now that we've calculated the average distance per LSOA, we can load the other variables used in the index. 
+
+```{r Index}
+#First, let's create a new object for index variables
+
+LSOA_index <- dplyr::select(LSOA_with_average,c("LSOA_CODE","MSOA11CD","LAD11CD","LAD11NM","average_distance"))
+
+
+#Log transform distance
+LSOA_index$logdist <- log(LSOA_index$average_distance)
+
+#Calculate z score
+LSOA_index$zdist = scale(LSOA_index$logdist,center=TRUE,scale=TRUE)
+
+#Remove outliers where z score is more than 3 in either direction
+LSOA_index$zdist[LSOA_index$zdist > 3] <- 3
+LSOA_index$zdist[LSOA_index$zdist < -3] <- -3
+
+```
+
+
+#### Road accidents 
+
+Road accident data per 1000 people was taken from the underlying indicators of the 2019 Index of Multiple Deprivation, published by the [Ministry of Housing, Communities & Local Government](https://assets.publishing.service.gov.uk/government/uploads/system/uploads/attachment_data/file/833992/File_8_-_IoD2019_Underlying_Indicators.xlsx)
+
+```{r}
+accident_indicator <- read.csv(here::here("Raw_data", "underlying_indicators.csv")) %>% janitor::clean_names() %>%
+                      dplyr::select(.,c("lsoa_code_2011","road_traffic_accidents_indicator"))
+
+#Add to index sf
+LSOA_index <-dplyr::left_join(LSOA_index,accident_indicator,by=c("LSOA_CODE"="lsoa_code_2011"))
+
+#Calculate log and z score
+LSOA_index$logaccident = log(LSOA_index$road_traffic_accidents_indicator)
+LSOA_index$zaccident = scale(LSOA_index$logaccident,center=TRUE,scale=TRUE)
+  
+#Deal with outliers
+LSOA_index$zaccident[LSOA_index$zaccident > 3] <- 3
+LSOA_index$zaccident[LSOA_index$zaccident < -3] <- -3
+
+```
+
+#### Air quality 
+
+Air quality data was also taken from the underlying indicators of the 2019 Index of Multiple Deprivation, published by the [Ministry of Housing, Communities & Local Government](https://assets.publishing.service.gov.uk/government/uploads/system/uploads/attachment_data/file/833992/File_8_-_IoD2019_Underlying_Indicators.xlsx)
+
+```{r}
+airindex <- read.csv(here::here("Raw_data","underlying_indicators.csv")) %>% janitor::clean_names() %>% dplyr::select(.,c("lsoa_code_2011","air_quality_indicator"))
+
+#Data appears normally distributed, no need to transform
+#add to index data frame
+LSOA_index <-dplyr::left_join(LSOA_index,airindex,by=c("LSOA_CODE"="lsoa_code_2011"))
+
+LSOA_index$zairquality = scale(LSOA_index$air_quality_indicator,center=TRUE,scale=TRUE)
+
+```
+
+
+#### Car ownership
+
+Information on car ownership was obtained from the LSOA Atlas published by the [Greater London Authority](https://data.london.gov.uk/dataset/lsoa-atlas#:~:text=The%20LSOA%20atlas%20provides%20a,and%2013%2C078%20for%20a%20ward.), based on 2011 Census data
+
+```{r}
+#no cars in household percentage from 2011 census
+no_cars <- read.csv(here::here("Raw_data","lsoa-data.csv")) %>% janitor::clean_names() %>% 
+          dplyr::select(.,c("lower_super_output_area","car_or_van_availability_no_cars_or_vans_in_household_2011_2"))
+
+#add to index and calculate z score
+LSOA_index <-dplyr::left_join(LSOA_index,no_cars,by=c("LSOA_CODE"="lower_super_output_area"))
+LSOA_index$zcars = scale(LSOA_index$car_or_van_availability_no_cars_or_vans_in_household_2011_2,center=TRUE,scale=TRUE)
+
+```
+
+Let's plot the distribution of each variable 
+
+```{r variables_hist, fig.align="center",fig.cap="Figure 4: Histogram of A.) Network Travel Distance to School, B.) Road traffic accidents per 1000 people, C.) Air quality indicator, and D.) Percentage of households with no cars. Note: Distance and Traffic accidents are plotted on a log10 scale and were transformed before z-score normalization was carried out"}
+dist <- LSOA_index %>%
+  ggplot( aes(x=average_distance)) +
+  geom_histogram(bins=100, fill='#470137', color='gray') + scale_x_log10()+
+  xlab("Network Travel Distance (km)")+
+  ylab("Count")
+
+accidents <- accident_indicator %>%
+  ggplot( aes(x=road_traffic_accidents_indicator)) +
+  geom_histogram(bins=100, fill="#040147", color="gray") + scale_x_log10()+
+  xlab("Road Traffic Accidents (per 1000 people)")+
+  ylab("Count") 
+
+air <- airindex %>%
+  ggplot( aes(x=air_quality_indicator)) +
+  geom_histogram(bins=100, fill='#024a28', color='gray') +
+  xlab("Air Quality Indicator")+
+  ylab("Count") 
+
+cars <- no_cars %>%
+  ggplot( aes(x=car_or_van_availability_no_cars_or_vans_in_household_2011_2)) +
+  geom_histogram(bins=100, fill='#470107', color='gray') +
+  xlab("% of Households with No Car")+
+  ylab("Count") 
+
+#set aesthetics and labels
+dist <- dist + scale_y_continuous(expand = c(0, 0), limits=c(0,300)) + theme_bw()
+dist <- ggdraw(add_sub(dist, expression(paste("Plotted on log"[10]," scale")),size=9))
+accidents <- accidents + scale_y_continuous(expand = c(0, 0), limits=c(0,400)) + theme_bw()
+accidents <-ggdraw(add_sub(accidents, expression(paste("Plotted on log"[10]," scale")),size=9))
+air <- air + scale_y_continuous(expand = c(0, 0), limits=c(0,250)) + theme_bw()
+cars <- cars+ scale_y_continuous(expand = c(0, 0), limits=c(0,100)) + theme_bw()
+
+#Plot in a grid
+variables_hist <-  plot_grid(
+    dist,accidents, air, cars,
+    labels = "AUTO",
+    label_size = 12,
+    label_x = 0, label_y = 0,
+    hjust = -0.5, vjust = -0.5
+  )
+
+variables_hist
+```
+
+Summary statistics for each variable: 
+
+```{r}
+#Get summary stats
+summary(LSOA_index$road_traffic_accidents_indicator)
+summary(LSOA_index$air_quality_indicator)
+summary(LSOA_index$car_or_van_availability_no_cars_or_vans_in_household_2011_2)
+
+sd(LSOA_index$road_traffic_accidents_indicator)
+sd(LSOA_index$air_quality_indicator)
+sd(LSOA_index$car_or_van_availability_no_cars_or_vans_in_household_2011_2)
+
+var(LSOA_index$road_traffic_accidents_indicator)
+var(LSOA_index$air_quality_indicator)
+var(LSOA_index$car_or_van_availability_no_cars_or_vans_in_household_2011_2)
+```
+
+Next, let's plot our z scores per LSOA for each variable
+
+```{r mapping variables, fig.align="center", fig.cap="Figure 5: Z-scores by LSOA of A.) Network Travel Distance to School, B.)Road traffic accidents per 1000 people, C.) Air quality indicator, and D.) Percentage of households with no cars"}
+
+Distance <- ggplot() +
+  geom_sf(data = LSOA_index, aes(fill = zdist), color=NA) +
+  geom_sf(data = Boroughs, fill = "transparent",color = "white",size = 0.5)+ 
+  scale_fill_gradient(high = "#470137", low = "white", guide = "colorbar",breaks=c(-2,0,2)) +
+  labs(fill = "Z-Score")+
+  theme_map()+ theme(legend.title = element_text(color = "black", size = 10))
+
+
+Accidents <- ggplot() +
+  geom_sf(data = LSOA_index, aes(fill = zaccident), color=NA) +
+  geom_sf(data = Boroughs, fill = "transparent",color = "white",size = 0.5)+ 
+  scale_fill_gradient(high = "#040147", low = "white", guide = "colorbar",breaks=c(-2,0,2)) +
+  labs(fill = "Z-score")+
+  theme_map()+ theme(legend.title = element_text(color = "black", size = 10))
+
+Air <- ggplot() +
+  geom_sf(data = LSOA_index, aes(fill = zairquality), color=NA) +
+  geom_sf(data = Boroughs, fill = "transparent",color = "white",size = 0.5)+ 
+  scale_fill_gradient(high = "#024a28", low = "white", guide = "colorbar",breaks=c(-2,0,2)) +
+  labs(fill = "Z-Score")+
+  theme_map()+ theme(legend.title = element_text(color = "black", size = 10))
+
+
+Nocars <- ggplot() +
+  geom_sf(data = LSOA_index, aes(fill = zcars), color=NA) +
+  geom_sf(data = Boroughs, fill = "transparent",color = "white",size = 0.5)+ 
+  scale_fill_gradient(high = "#470107", low = "white", guide = "colorbar",breaks=c(-2,0,2)) +
+  labs(fill = "Z-Score")+
+  theme_map() + theme(legend.title = element_text(color = "black", size = 10))
+
+#Plot them together 
+Variables <- plot_grid(
+  Distance,Accidents, Air, Nocars,
+  labels = "AUTO",
+  label_size = 12,
+  label_x = 0, label_y = 0,
+  hjust = -0.5, vjust = -0.5
+)
+
+Variables
+```
+
+#### Combining variables to produce index
+
+Finally. we can create the final index by applying weights to the variables and summing the z scores. The final index can then be plotted. 
+
+```{r final index, fig.align="center", fig.cap="Figure 6: The Dependence on Public Transport Index mapped. Children living in LSOAs with a greater index value are more dependent on public transport"}
+#First, let's assign weights
+#Distance: 45%
+#Air quality= 10%LL
+#Road accidents= 20%
+#Access to cars = 25%
+
+LSOA_index$indexdist <- LSOA_index$zdist*0.45
+LSOA_index$indexairquality <- LSOA_index$zairquality*0.10
+LSOA_index$indexacc<- LSOA_index$zaccident*0.20
+LSOA_index$indexcars<- LSOA_index$zcars*0.25
+
+
+#Now add the four together to make final index
+LSOA_index$final_index <- LSOA_index$indexdist +
+  LSOA_index$indexairquality +
+  LSOA_index$indexacc+
+  LSOA_index$indexcars
+
+# Let's map it
+
+RelianceIndex <- ggplot() +
+  geom_sf(data = LSOA_index, aes(fill = final_index),color=NA) +
+  geom_sf(data = Boroughs, fill = "transparent",color = "white",size = 0.5)+ 
+  scale_fill_gradient2(high = "#8f0114", low = "#080185",mid="lightgray", guide = "colorbar") +
+  labs(fill = "Dependence on \nPublic Transport \nIndex")+
+  theme_map()+
+  theme(legend.title = element_text(color = "black", size = 10))
+
+RelianceIndex
+```
+
+## 3. Deprivation and BAME 
+
+Once we've created our index, we can now see how it compares to other geographic statistics, such as deprivation and ethnic minority populations. 
+
+First, we want to group our index into quintiles to identify the LSOAs in the top dependence quintile. 
+
+```{r quintiles, fig.align="center", fig.cap= "Figure 7: Index of Dependence on Public Transport, grouped by quintiles"}
+#remove NAs
+LSOA_index <- LSOA_index %>%  drop_na()
+
+#Let's get quintiles of Reliance index
+Reliance_quintiles <- LSOA_index %>%
+  pull(final_index) %>%
+  quantile(probs = seq(0, 1, length.out = 6))
+
+
+#Now we want to group them
+LSOA_index <- LSOA_index %>% mutate(
+    index_quintiles = (cut(
+      final_index,
+      breaks = Reliance_quintiles,
+      include.lowest = TRUE)))
+
+LSOA_index <- LSOA_index %>% mutate(
+  index_quintiles_groups = as.numeric(cut(
+    final_index,
+    breaks = Reliance_quintiles,
+    include.lowest = TRUE)))
+
+#Now we can calculate what percentage of kids is in the 20% most reliant on public transportation
+#Let's map the quintiles 
+IDPT <- ggplot()+
+  geom_sf(data=LSOA,fill="darkgray",color=NA)+
+  geom_sf(data=LSOA_index, aes(fill=index_quintiles),color=NA)+
+  scale_fill_brewer(palette = "OrRd",labels = c("1", "2","3","4","5")) + 
+  labs(fill = "Dependence on \nPublic Transport \nQuintile")+
+  geom_sf(data = Boroughs,
+          fill = "transparent",
+          color = "white",
+          size = 0.5) +
+  theme_map()+
+  theme(legend.title = element_text(color = "black", size = 10))
+
+IDPT
+
+#We want to subset the ones that are in the top 20% 
+top_dependence <- LSOA_index %>% filter(index_quintiles_groups==5)
+```
+
+### Deprivation 
+
+First, we want to look at IMD scores, the IMD deciles were taken from the 2019 Index of Multiple Deprivation, published by the [Ministry of Housing, Communities & Local Government](https://assets.publishing.service.gov.uk/government/uploads/system/uploads/attachment_data/file/833970/File_1_-_IMD2019_Index_of_Multiple_Deprivation.xlsx)
+
+
+```{r}
+deprivation <- read.csv(here::here("Raw_data", "IMD_data_2019.csv")) %>% clean_names() %>% 
+  dplyr::select(.,c(lsoa_code_2011,index_of_multiple_deprivation_imd_decile_where_1_is_most_deprived_10_of_lso_as)) %>% dplyr::rename(c("LSOA_CODE"=lsoa_code_2011,"Decile"=index_of_multiple_deprivation_imd_decile_where_1_is_most_deprived_10_of_lso_as))
+
+#join with LSOA
+LSOA_IMD <- left_join(LSOA,deprivation,by="LSOA_CODE")
+
+#Join with top_dependence index
+top_dependence <- left_join(top_dependence,deprivation,by="LSOA_CODE")
+
+#Get number in the top 20% most deprived
+Most_deprived <- top_dependence %>% dplyr::filter(.,Decile<3)
+
+proportion= nrow(Most_deprived)/nrow(top_dependence)*100
+
+
+#Compare with all of london
+Most_deprived_london <- LSOA_IMD %>% filter(.,Decile<3)
+proportion_london <- nrow(Most_deprived_london)/nrow(deprivation)*100
+
+percentages <- data.frame(Variable="% In IMD deciles 1 and 2", "Top Dependent"=proportion, London=proportion_london)
+
+```
+
+### BAME
+
+Second, we want to look at %BAME inhabitants. These were taken from the LSOA London Atlas, based on the 2011 Census
+
+```{r}
+BAME <- read.csv(here::here("Raw_data","lsoa-data.csv")) %>% clean_names() %>%  
+  dplyr::select(.,c(lower_super_output_area,ethnic_group_bame_2011_2))
+
+LSOA_Bame <- left_join(LSOA,BAME,by=c("LSOA_CODE"="lower_super_output_area"))
+
+#Join data to the most dependent 
+top_dependence <- left_join(top_dependence,BAME,by=c("LSOA_CODE"="lower_super_output_area"))
+
+#For the top quintile
+proportion_bame <- sum(top_dependence$ethnic_group_bame_2011_2)/nrow(top_dependence)
+#For all of London
+proportion_bame_london <- sum(BAME$ethnic_group_bame_2011_2)/nrow(BAME)
+
+bame_percentages <- data.frame(Variable="% BAME", "Top Dependent"=proportion_bame, London=proportion_bame_london)
+```
+
+Let's summarise the proportions
+
+```{r}
+percentages <- rbind(percentages,bame_percentages)
+
+kable(percentages)
+
+```
+#### Mapping IMD and BAME
+
+```{r, fig.cap="Figure 8: Chloropleth Map showing the LSOAs in the 5th quintile of IDPT showing A.) Index of Multiple Deprivation (IMD) and B.) Proportion of BAME inhabitants"}
+BAME <- ggplot()+geom_sf(data=Boroughs,fill="gray",color="white")+ 
+  theme_map()+
+  geom_sf(data=LSOA_Bame,aes(fill=ethnic_group_bame_2011_2),color=NA,size=0.005,alpha=0.2)+
+  geom_sf(data=top_dependence,aes(fill=ethnic_group_bame_2011_2),color="white",size=0.01)+
+  geom_sf(data=Boroughs,fill="transparent",color="white")+
+  scale_fill_continuous(high="#850101",low="white")+
+  labs(fill="% BAME")
+
+
+IMD <- ggplot()+geom_sf(data=Boroughs,fill="gray",color="white")+theme_map()+
+  geom_sf(data=LSOA_IMD,aes(fill=Decile),color=NA,size=0.005,alpha=0.2)+
+  geom_sf(data=top_dependence,aes(fill=Decile),color="white",size=0.01)+
+  geom_sf(data=Boroughs,fill="transparent",color="white")+
+  scale_fill_gradient(high="white",low="#00137d",breaks=c(1,2,3,4,5,6,7,8,9,10),minor_breaks=waiver(),guide = guide_legend(reverse = FALSE))+
+  labs(fill="IMD \nPercentile")+theme(legend.text=element_text(size=8))+
+  theme(legend.title=element_text(size=10))
+
+
+BAME <- BAME +  theme(legend.key.size = unit(0.3, "cm"),legend.key.width = unit(0.5,"cm"),legend.title=element_text(size=10),legend.text=element_text(size=8))
+IMD <- IMD+ theme(legend.key.size = unit(0.2, "cm"),legend.key.width = unit(0.5,"cm"))
+
+
+Proportions <-  plot_grid(
+  IMD,BAME,
+  labels = "AUTO",
+  label_size = 12,
+  label_x = 0, label_y = 0,
+  hjust = -0.5, vjust = -0.5
+)
+
+Proportions<- Proportions + draw_label("% in Deciles 1 & 2", x=0.05, y=0.12, hjust=0, fontface="bold", color = "black", size = 10)+
+  draw_label("20% most dependent on transport = 38%", x=0.05, y=0.07, hjust=0,color = "black", size = 8)+
+  draw_label("All of London = 16%", x=0.05, y=0.02, hjust=0,color = "black", size = 8)+
+  draw_label("% BAME", x=0.55, y=0.12, hjust=0, fontface="bold", color = "black", size = 10)+
+  draw_label("20% most dependent on transport = 46%", x=0.55, y=0.07, hjust=0,color = "black", size = 8)+
+  draw_label("All of London = 39%", x=0.55, y=0.02, hjust=0,color = "black", size = 8)
+
+Proportions
+
+
+```
+
+#### Proportion of top dependent LSOAs in Central London
+
+Let's see how the 7 central London boroughs compare to the rest of London
+
+```{r}
+#Filter out central London
+Central_London <- top_dependence %>% 
+  dplyr::filter(LAD11NM %in% c("City of London","Camden","Islington","Kensington and Chelsea","Lambeth","Southwark","Westminster"))
+
+proportion_central_london <- nrow(Central_London)/nrow(top_dependence)*100
+
+t <-  st_join(LSOA_index, Boroughs,join=st_contains,left = TRUE)
+
+
+Central_London_LSOAs <- LSOA_index %>% 
+  dplyr::filter(LAD11NM %in% c("City of London","Camden","Islington","Kensington and Chelsea","Lambeth","Southwark","Westminster"))
+
+proportion_central_london_LSOA <- nrow(Central_London_LSOAs)/nrow(LSOA_index)*100
+
+central_percentages <- data.frame(Variable=c("LSOAS","LSOAs in 5th IPTD Quintile"), Central_London=c(nrow(Central_London_LSOAs),nrow(Central_London)), All_of_London=c(nrow(LSOA_index),nrow(top_dependence)),Percentage=c(proportion_central_london_LSOA,proportion_central_london))
+
+kable(central_percentages)
+```
+
+## 4. Bivariate Plot - Income and IPTD
+
+Finally, we want to create a bivariate plot mapping IPTD against household income. 
+Income estimates for 2018 were obtained from the [Office of National Statistics](https://www.ons.gov.uk/employmentandlabourmarket/peopleinwork/earningsandworkinghours/datasets/smallareaincomeestimatesformiddlelayersuperoutputareasenglandandwales)
+
+First, we loaded the data. As income data was at MSOA Level, the data had to be matched to it's corresponding LSOA code. 
+
+The code used to produce the bivariate map was largely inspired by [Tim Grossenbacher](https://timogrossenbacher.ch/2019/04/bivariate-maps-with-ggplot2-and-sf/)
+
+```{r}
+#Load income data and filter for London
+Income <- read.csv(here::here("Raw_data", "incomeestimates.csv")) %>% 
+  dplyr::filter(str_detect(Local.authority.code, "^E09")) %>% 
+  clean_names() %>% 
+  rename(MSOA11CD="msoa_code") %>% 
+  rename(income="net_annual_income_after_housing_costs_u_fffd") 
+
+#Make a new data frame with just MSOA code and Income
+Income <- dplyr::select(Income,MSOA11CD,income)
+Income$income <- as.numeric(gsub("\\,", "",Income$income))
+
+#Merge to LSOA with index df
+LSOA_index <- dplyr::left_join(LSOA_index, Income, by = "MSOA11CD")
+
+#Drop NAs - these will cause problems when making the classes
+LSOA_bivariate<- 
+  LSOA_index %>% drop_na()
+
+```
+
+We then want to create three classes for both income and IPTD, representing high, middle, and low. We also want to map our bivariate colour scale to the corresponding class combinations. I used an online [bivariate color palette generator](https://observablehq.com/@benjaminadk/bivariate-choropleth-color-generator) to create the hex values for the colours. 
+
+```{r}
+# create 3 buckets for Income
+income_buckets <- LSOA_bivariate%>%
+  pull(income) %>%
+  quantile(probs = seq(0, 1, length.out = 4))
+
+# create 3 buckets for IPTD
+reliance_buckets <- LSOA_bivariate %>%
+  pull(final_index) %>%
+  quantile(probs = seq(0, 1, length.out = 4))
+
+# Colour scale = ["#d3d3d3", "#9ac5cf", "#42b6ca", "#d399bf", "#9a8ebb", "#4284b7", "#d352ad", "#9a4ca9", "#4247a5"]
+# create color scale that encodes the two variables
+bivariate_color_scale <- tibble(
+  "3 - 3" = "#64a776", # high IPTD, high income
+  "2 - 3" = "#9cbda6",
+  "1 - 3" = "#d3d3d3", # low IPTD, high income
+  "3 - 2" = "#548b76",
+  "2 - 2" = "#839da5", # medium IPTD, medium income
+  "1 - 2" = "#b1b0d2",
+  "3 - 1" = "#436f75", # high IPTD, low income
+  "2 - 1" = "#697ea4",
+  "1 - 1" = "#8e8cd1" # low IPTD, low income
+) %>%
+  gather("group", "fill")
+```
+
+We then want to cut the LSOAs by the group classes defined above
+
+```{r}
+# cut LSOA into groups defined above and join fill
+LSOA_bivariate%<>%
+  mutate(
+    income_quantiles = cut(
+      income,
+      breaks = income_buckets,
+      include.lowest = TRUE
+    ),
+    reliance_quantiles = cut(
+      final_index,
+      breaks = reliance_buckets,
+      include.lowest = TRUE
+    ),
+    # by pasting the factors together as numbers we match the groups defined
+    # in the tibble bivariate_color_scale
+    group = paste(
+      as.numeric(reliance_quantiles), "-",
+      as.numeric(income_quantiles)
+    )
+  ) %>%
+  # we now join the actual colour values per "group"
+  # so each LSOA knows its colour value based on the IPTD and 
+  # income value
+  left_join(.,bivariate_color_scale, by = "group")
+```
+
+#### Drawing the map
+
+Once we have our LSOAs by group, with the associated colour we can map it. 
+
+```{r, fig.cap="Figure 9:Bivariate map showing dependence on public transport against household income. Shades of darker green indicate high dependence with low income levels"}
+map <- ggplot()+
+  geom_sf(data=LSOA,fill="darkgray",color=NA)+
+  geom_sf(data=LSOA_bivariate,aes(fill = fill),color = NA) +
+  scale_fill_identity() +
+  geom_sf(data = Boroughs,
+    fill = "transparent",
+    color = "white",
+    size = 0.5) +
+  theme_map()
+
+#make the legend
+# separate the groups
+bivariate_color_scale %<>%
+  separate(group, into = c( "final_index","income"), sep = " - ") %>%
+  mutate(income = as.integer(income),
+         index = as.integer(final_index))
+
+legend <- ggplot() +
+  geom_tile(
+    data = bivariate_color_scale,
+    mapping = aes(
+      x = final_index,
+      y = income,
+      fill = fill)
+  ) +
+  scale_fill_identity() +
+  labs(x = "Greater dependence \non public transport ⟶️" ,
+       y = "⟵ Lower income️") +
+  theme_map() +
+  # make font small enough and rotate y label
+  theme(axis.title = element_text(size = 6)
+  ) +
+  theme(axis.title.y = element_text(angle=90,vjust=1))+
+  theme(axis.title.x=element_text(vjust=50)) +
+  # make it square
+  coord_fixed()
+
+
+Bivariate <- ggdraw() +
+  #draw_plot(basemap, 0, 0, 1, 1) +
+  draw_plot(map, 0, 0, 1, 1) +
+  draw_plot(legend, 0, 0.03, 0.3, 0.3)
+
+#Bivariate 
+
+```
+
+![Alt text](C:\Users\signe\OneDrive - University College London\Documents\UCL_MSc\CASA0005_GIS\GIS_Coursework\Coursework\bivariate.png)
+
+Figure 9:Bivariate map showing dependence on public transport against household income. Shades of darker green indicate high dependence with low income levels
+
+
+#### Top groups by borough
+
+Finally, we want to get the top groups by borough
+
+```{r, fig.cap="Figure 10:Proportion of LSOAs with High IDPT and Low Income, by Borough"}
+#Filter out those with low income, high IPTD
+top_groups <- LSOA_bivariate %>% filter(.,group=="3 - 1") %>% st_set_geometry(.,NULL)
+
+#by borough
+top_groups_by_borough <- top_groups %>% count(LAD11NM) 
+BY_BOROUGH<- LSOA_bivariate %>% count(LAD11NM) %>% st_set_geometry(.,NULL)
+BY_BOROUGH <- left_join(BY_BOROUGH, top_groups_by_borough, by="LAD11NM")
+
+#Get proportion of low income, high IPTD by borough
+BY_BOROUGH <- mutate(BY_BOROUGH, proportion=(n.y/n.x*100)) 
+
+#Add proportion to Boroughs geometry
+Boroughs <- left_join(Boroughs,BY_BOROUGH, by=c("NAME"="LAD11NM")) 
+Boroughs[is.na(Boroughs)] <- 0
+
+#Label the top 3 boroughs
+label_points<- st_centroid(Boroughs)
+label_points <- cbind(Boroughs, st_coordinates(st_centroid(Boroughs$geometry))) %>%
+  filter(.,NAME %in% c("Haringey","Hackney","Southwark"))
+
+#Map
+Borough <-ggplot(Boroughs)+geom_sf(aes(fill=proportion),colour="white")+
+  scale_fill_gradient(name="Proportion (%) LSOAs \nwith High IDPT \nand Low Income", high="#436f75", low="#e1e6ed")+
+  #geom_sf_label(aes(label = NAME),label.size=0.01)+
+  geom_text(data= label_points,aes(x=X,y=Y,label=NAME),
+            color = "black", size=2, check_overlap = FALSE)+
+  theme_map()+
+  theme(legend.title = element_text(color = "black", size = 8),
+        legend.text = element_text(size=10))
+
+Borough
+
+```
+
