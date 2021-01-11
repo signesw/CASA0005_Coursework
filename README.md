@@ -6,3 +6,5 @@ The Final_code.Rmd contains all the code used in the analysis. A step-by-step pr
 
 The Raw_data includes all the datafiles used for the analysis. Please make sure you clone this repository if reproducing the code.
 
+Signe Swarttouw
+
